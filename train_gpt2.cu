@@ -1,37 +1,5 @@
 /*
-GPT-2 Transformer Neural Net trained in raw CUDA
-GPT-2 Transformer Neural Net trained in raw CUDA
-Non-trivial notes to be aware of:
-
-We are being clever in the backward pass to conserve memory.
-In particular, all parameters use a += in the backward pass, so we
-can later do gradient accumulation. But all activations have = instead of +=
-because these are faster (just read, no write). This is okay for all activations
-except for those in the residual stream, where the gradients have to add. We make
-sure that those parts work out ok and that we do a += as necessary. E.g.,
-the layernorms are connected to the residuals so we += in layernorm backward.
-
-In this file we are using Mixed Precision training, so different activations,
-parameters, grads and buffers may be kept at different precisions, to take
-advantage of the fast low-precision hardware in the latest GPUs (bf16/fp16),
-and fp8 (coming soon^TM).
-
-Compile:
-make train_gpt2cu
-
-Example launch using bfloat16 on 1 GPU batch size 8, sample/eval every 200 steps:
-Also we're using TinyStories here for example as it is a bigger dataset
-./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-Example launch using bfloat16 on 4 GPUs, same as above:
-mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-If you'd like to see train_gpt2.cu produce identical results to
-`python train_gpt2.py`, you can run it like this:
-make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
--a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
+GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 #include <unistd.h>
@@ -39,16 +7,11 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
-// implementation of dirent for Windows is in dev/unistd.h
-#ifndef _WIN32
-#include <dirent.h>
-#endif
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -62,15 +25,19 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
+// defines: create_dir_if_not_exists, find_max_step
+#include "llmc/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
+#include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
-#include "dataloader.h"
-// defines: manual_seed, normal_
-// numerically identical to PyTorch's torch.manual_seed and torch.normal
-#include "rand.h"
+#include "llmc/dataloader.h"
+// defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
+#include "llmc/rand.h"
+// defines: sample_softmax
+#include "llmc/sampler.h"
+// defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
+#include "llmc/logger.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -543,6 +510,14 @@ void destroy_cudnn() {}
 
 // ----------------------------------------------------------------------------
 // all the kernels
+/*
+Note that we are being clever in the backward pass to conserve memory.
+All parameters use a += in the backward pass, so we can do gradient accumulation.
+But all activations have = instead of += because these are faster (just read, no write).
+This is okay for all activations except for those in the residual stream, where the
+gradients have to add. We make sure that we do a += as necessary.
+E.g., the layernorms are connected to the residuals so we += in layernorm backward.
+*/
 
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
@@ -2044,7 +2019,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -2056,12 +2032,13 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
-    act_sizes[8] = L * B * T * C; // ln2
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : B * T * C; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    act_sizes[12] = (recompute == 0) ? L * B * T * 4*C : B * T * 4*C;
+    act_sizes[12] = (recompute < 1) ? L * B * T * 4*C : B * T * 4*C;
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
     act_sizes[15] = B * T * C; // lnf
@@ -2480,18 +2457,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_fcproj = acts.fcproj + l * B * T * C;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
@@ -2517,7 +2494,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.ln1;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
@@ -2635,9 +2612,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2654,17 +2633,17 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -2682,6 +2661,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        if(model->recompute >= 2) {
+            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
@@ -2698,7 +2681,9 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
-
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
@@ -2938,112 +2923,11 @@ void common_free(GPT2 &model) {
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-// ----------------------------------------------------------------------------
-// sampler: takes probabilities and samples integers from them
-
-int sample_softmax(const float* logits, int n, float coin) {
-    // sample index from logits (converted to probabilities using softmax)
-    // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
-    for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
-    }
-    // instead of dividing all exp(logits), we can just multiply coin.
-    coin *= norm;
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
-        if (coin < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// Logger lite, will probably grow/change some over time
-// Logger is stateless, uses append mode to write to file
-
-void create_dir_if_not_exists(const char *dir) {
-    if (dir == NULL) { return; }
-    struct stat st = {0};
-    if (stat(dir, &st) == -1) {
-        if (mkdir(dir, 0700) == -1) {
-            printf0("ERROR: could not create directory: %s\n", dir);
-            exit(EXIT_FAILURE);
-        }
-        printf0("created directory: %s\n", dir);
-    }
-}
-
-typedef struct {
-    int active;
-    char output_log_file[512];
-} Logger;
-
-void logger_init(Logger *logger, const char *log_dir, int process_rank, int resume) {
-    // currently, only rank 0 writes logs
-    logger->active = 0;
-    if (log_dir != NULL && process_rank == 0) {
-        logger->active = 1;
-        assert(strlen(log_dir) < 500); // being a bit lazy, could relax later
-        snprintf(logger->output_log_file, 512, "%s/main.log", log_dir);
-        if (resume == 0) {
-            // wipe any existing logfile clean if we're starting fresh
-            FILE *logfile = fopenCheck(logger->output_log_file, "w");
-            fclose(logfile);
-        }
-    }
-}
-
-void logger_log_eval(Logger *logger, int step, float val) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d eval:%.4f\n", step, val);
-        fclose(logfile);
-    }
-}
-
-void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d tel:%.4f\n", step, val_loss);
-        fclose(logfile);
-    }
-}
-
-void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d trl:%.4f\n", step, train_loss);
-        fclose(logfile);
-    }
-}
 
 // ----------------------------------------------------------------------------
 // training resumption logic, very useful when jobs crash once in a while
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
 // note that "state" refers to things not already saved in the model checkpoint file
-
-int find_max_step(const char* output_log_dir) {
-    // find the DONE file in the log dir with highest step count
-    if (output_log_dir == NULL) { return -1; }
-    DIR* dir;
-    struct dirent* entry;
-    int max_step = -1;
-    dir = opendir(output_log_dir);
-    if (dir == NULL) { return -1; }
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "DONE_", 5) == 0) {
-            int step = atoi(entry->d_name + 5);
-            if (step > max_step) {
-                max_step = step;
-            }
-        }
-    }
-    closedir(dir);
-    return max_step;
-}
 
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
@@ -3084,8 +2968,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    loader->current_shard = state_header[30]; // shard of the dataset
-    loader->current_position = *((int64_t*)&state_header[31]); // position in shard
+    int current_shard = state_header[30]; // shard of the dataset
+    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
+    dataloader_resume(loader, current_shard, current_position);
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -3140,7 +3025,7 @@ void error_usage() {
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
-    fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     exit(EXIT_FAILURE);
 }
 
@@ -3173,7 +3058,6 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    float grad_clip  = 1.0f;
     int hellaswag_eval = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -3201,7 +3085,6 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'c') { grad_clip = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
@@ -3242,7 +3125,6 @@ int main(int argc, char *argv[]) {
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
-    printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
@@ -3540,7 +3422,7 @@ int main(int argc, char *argv[]) {
             step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
         }
         // update the model parameters
-        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_clip, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
